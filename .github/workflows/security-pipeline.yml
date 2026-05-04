@@ -1,0 +1,147 @@
+name: Node.js DevSecOps Pipeline (walid1)
+
+# ─────────────────────────────────────────────────────────────────
+# Déclencheur : le pipeline s'exécute sur chaque push ou pull_request
+# vers la branche principale
+# ─────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 1 : SAST — Analyse Statique du code source (CodeQL)
+  # Détecte : injections SQL, secrets codés en dur, failles logiques
+  # ═══════════════════════════════════════════════════════════════
+  sast-scan:
+    name: Analyse Statique CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # Permet à CodeQL de publier les alertes
+      actions: read
+      contents: read
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Initialisation de CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript   # NestJS est du JavaScript/TypeScript
+          queries: security-and-quality
+
+      - name: Auto-build du projet
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Exécution de l'analyse CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 2 : SCA — Analyse des dépendances (Trivy)
+  # Détecte : bibliothèques npm avec des CVE connues
+  # ═══════════════════════════════════════════════════════════════
+  sca-scan:
+    name: Analyse SCA Trivy (dépendances npm)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Scan des dépendances du backend (package.json / node_modules)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './back'          # Dossier backend du projet walid1
+          format: 'table'
+          exit-code: '0'             # On ne bloque pas le pipeline sur cette étape
+          ignore-unfixed: true       # Ignorer les CVE sans correctif disponible
+          vuln-type: 'library'       # Uniquement les dépendances (pas l'OS)
+          severity: 'HIGH,CRITICAL'  # Alerter uniquement sur HIGH et CRITICAL
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 3 : DAST — Analyse Dynamique Authentifiée (OWASP ZAP)
+  # Attaque l'application en cours d'exécution pour trouver des
+  # vulnérabilités (XSS, IDOR, headers manquants, etc.)
+  # ═══════════════════════════════════════════════════════════════
+  dast-scan:
+    name: Analyse Dynamique OWASP ZAP
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write     # Permet à ZAP de créer un ticket si faille détectée
+      contents: read
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Installation de Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── Démarrer l'application backend NestJS ──
+      - name: Installation des dépendances et démarrage du backend
+        run: |
+          cd back
+          npm install
+          npm run build
+          npm run start:prod &
+          sleep 10    # Attendre que le serveur soit prêt sur le port 3000
+        env:
+          NODE_ENV: test
+          PORT: 3000
+          # Variables d'environnement minimales pour le démarrage sans DB
+          DB_HOST: localhost
+          DB_PORT: 3306
+          DB_USERNAME: root
+          DB_PASSWORD: ""
+          DB_NAME: pdf_app
+          DB_SYNCHRONIZE: false
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+
+      # ── Correction de permissions pour le conteneur ZAP ──
+      - name: Accorder les permissions au conteneur ZAP
+        run: chmod 777 $GITHUB_WORKSPACE
+
+      # ── Lancement du scan OWASP ZAP ──
+      - name: Scan OWASP ZAP (Authentifié avec JWT Token)
+        uses: zaproxy/action-baseline@v0.14.0
+        env:
+          ZAP_AUTH_HEADER: "Authorization"
+          ZAP_AUTH_HEADER_VALUE: "${{ secrets.ZAP_AUTH_TOKEN }}"
+          ZAP_AUTH_HEADER_SITE: "http://localhost:3000"
+        with:
+          target: 'http://localhost:3000'
+          fail_action: false          # Ne pas bloquer le pipeline sur les alertes ZAP
+          rules_file_name: '.github/workflows/zap-rules.tsv'  # (optionnel) règles personnalisées
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 4 : Secret Scanning (Audit manuel des secrets exposés)
+  # Vérifie qu'aucun mot de passe / clé API n'est commité en clair
+  # NB : GitHub Secret Scanning est activé automatiquement sur les
+  # dépôts publics. Ce job ajoute une couche supplémentaire avec Trivy.
+  # ═══════════════════════════════════════════════════════════════
+  secret-scan:
+    name: Scan de Secrets exposés (Trivy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Détection de secrets dans le code source
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          scanners: 'secret'         # Mode scan de secrets uniquement
+          exit-code: '1'             # BLOQUE le pipeline si un secret est trouvé !
+          severity: 'HIGH,CRITICAL'
